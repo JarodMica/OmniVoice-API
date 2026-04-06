@@ -24,5 +24,11 @@ from omnivoice.models.omnivoice import (
     OmniVoiceConfig,
     OmniVoiceGenerationConfig,
 )
+from omnivoice.tts_api import OmniVoiceTTSEngine
 
-__all__ = ["OmniVoice", "OmniVoiceConfig", "OmniVoiceGenerationConfig"]
+__all__ = [
+    "OmniVoice",
+    "OmniVoiceConfig",
+    "OmniVoiceGenerationConfig",
+    "OmniVoiceTTSEngine",
+]

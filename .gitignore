@@ -28,3 +28,4 @@ examples/exp*/
 .claude/
 *.wav
 *.jsonl
+local_models/
