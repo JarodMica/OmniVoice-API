@@ -136,6 +136,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--share", action="store_true", default=False, help="Create public link."
     )
+    parser.add_argument(
+        "--no-asr",
+        action="store_true",
+        default=False,
+        help="Skip loading Whisper ASR model. Reference text auto-transcription"
+        " will be unavailable.",
+    )
     return parser
 
 
@@ -198,17 +205,15 @@ def build_demo(
                 ref_text=ref_text,
             )
 
-        if mode == "design":
-            if instruct and instruct.strip():
-                kw["instruct"] = instruct.strip()
+        if instruct and instruct.strip():
+            kw["instruct"] = instruct.strip()
 
         try:
             audio = model.generate(**kw)
         except Exception as e:
             return None, f"Error: {type(e).__name__}: {e}"
 
-        waveform = audio[0].squeeze(0).numpy()  # (T,)
-        waveform = (waveform * 32767).astype(np.int16)
+        waveform = (audio[0] * 32767).astype(np.int16)
         return (sampling_rate, waveform), "Done."
 
     # Allow external wrappers (e.g. spaces.GPU for ZeroGPU Spaces)
@@ -303,7 +308,7 @@ State-of-the-art text-to-speech model for **600+ languages**, supporting:
 - **Voice Design** — Create custom voices with speaker attributes
 
 Built with [OmniVoice](https://github.com/k2-fsa/OmniVoice)
-by Xiaomi Next-gen Kaldi team.
+by Xiaomi AI Lab Next-gen Kaldi team.
 """
         )
 
@@ -336,6 +341,8 @@ by Xiaomi Next-gen Kaldi team.
                             " to auto-transcribe via ASR models.",
                         )
                         vc_lang = _lang_dropdown("Language (optional) / 语种 (可选)")
+                        with gr.Accordion("Instruct (optional)", open=False):
+                            vc_instruct = gr.Textbox(label="Instruct", lines=2)
                         (
                             vc_ns,
                             vc_gs,
@@ -354,13 +361,13 @@ by Xiaomi Next-gen Kaldi team.
                         vc_status = gr.Textbox(label="Status / 状态", lines=2)
 
                 def _clone_fn(
-                    text, lang, ref_aud, ref_text, ns, gs, dn, sp, du, pp, po
+                    text, lang, ref_aud, ref_text, instruct, ns, gs, dn, sp, du, pp, po
                 ):
                     return _gen(
                         text,
                         lang,
                         ref_aud,
-                        None,
+                        instruct,
                         ns,
                         gs,
                         dn,
@@ -379,6 +386,7 @@ by Xiaomi Next-gen Kaldi team.
                         vc_lang,
                         vc_ref_audio,
                         vc_ref_text,
+                        vc_instruct,
                         vc_ns,
                         vc_gs,
                         vc_dn,
@@ -514,7 +522,7 @@ def main(argv=None) -> int:
         checkpoint,
         device_map=device,
         dtype=torch.float16,
-        load_asr=True,
+        load_asr=not args.no_asr,
     )
     print("Model loaded.")
 

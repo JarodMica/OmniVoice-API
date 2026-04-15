@@ -36,10 +36,11 @@ from dataclasses import dataclass, fields
 from functools import partial
 from typing import Any, List, Optional, Union
 
+import numpy as np
 import torch
+import torchaudio
 import torch.nn as nn
 import torch.nn.functional as F
-import torchaudio
 from torch.nn.attention.flex_attention import create_block_mask
 from transformers import (
     AutoFeatureExtractor,
@@ -310,12 +311,14 @@ class OmniVoice(PreTrainedModel):
     @torch.inference_mode()
     def transcribe(
         self,
-        audio: Union[str, tuple[torch.Tensor, int]],
+        audio: Union[str, tuple],
     ) -> str:
         """Transcribe audio using the loaded Whisper ASR model.
 
         Args:
-            audio: File path or (waveform, sample_rate) tuple.
+            audio: File path or ``(waveform, sample_rate)`` tuple.
+                Waveform can be a numpy array or torch.Tensor of shape
+                ``(1, T)`` or ``(T,)``.
 
         Returns:
             Transcribed text.
@@ -329,12 +332,11 @@ class OmniVoice(PreTrainedModel):
             return self._asr_pipe(audio)["text"].strip()
         else:
             waveform, sr = audio
-            if waveform.dim() == 1:
-                waveform = waveform.unsqueeze(0)
-            if waveform.size(0) > 1:
-                waveform = torch.mean(waveform, dim=0, keepdim=True)
+            if isinstance(waveform, torch.Tensor):
+                waveform = waveform.cpu().numpy()
+            waveform = np.squeeze(waveform)  # (1, T) or (T,) → (T,)
             audio_input = {
-                "array": waveform.squeeze(0).cpu().numpy(),
+                "array": waveform,
                 "sampling_rate": sr,
             }
             return self._asr_pipe(audio_input)["text"].strip()
@@ -475,7 +477,7 @@ class OmniVoice(PreTrainedModel):
         speed: Union[float, list[Optional[float]], None] = None,
         generation_config: Optional[OmniVoiceGenerationConfig] = None,
         **kwargs,
-    ) -> list[torch.Tensor]:
+    ) -> list[np.ndarray]:
         """Generate speech audio given text in various modes.
 
         Supports three modes:
@@ -522,8 +524,10 @@ class OmniVoice(PreTrainedModel):
                 audio_chunk_threshold: Only apply chunking if estimated audio
                     duration exceeds this threshold (seconds).
         Returns:
-            ``audios`` a list of 2-D ``torch.Tensor``, with the shape (1, T) and sampling rate
-            consistent with the model's audio tokenizer (usually 24000 Hz).
+            ``audios`` a list of 1-D ``np.ndarray`` with shape ``(T,)`` and
+            sampling rate consistent with the model's audio tokenizer
+            (usually 24 000 Hz).  Can be saved directly with
+            ``soundfile.write("out.wav", audios[0], model.sampling_rate)``.
         """
 
         if self.audio_tokenizer is None or self.text_tokenizer is None:
@@ -611,17 +615,19 @@ class OmniVoice(PreTrainedModel):
             ref_wav = load_audio(ref_audio, self.sampling_rate)
         else:
             waveform, sr = ref_audio
-            if waveform.dim() == 1:
-                waveform = waveform.unsqueeze(0)
-            if waveform.size(0) > 1:
-                waveform = torch.mean(waveform, dim=0, keepdim=True)
+            if isinstance(waveform, torch.Tensor):
+                waveform = waveform.cpu().numpy()
+            if waveform.ndim == 1:
+                waveform = waveform[np.newaxis, :]
+            if waveform.shape[0] > 1:
+                waveform = np.mean(waveform, axis=0, keepdims=True)
             if sr != self.sampling_rate:
                 waveform = torchaudio.functional.resample(
-                    waveform, sr, self.sampling_rate
-                )
+                    torch.from_numpy(waveform), orig_freq=sr, new_freq=self.sampling_rate,
+                ).numpy()
             ref_wav = waveform
 
-        ref_rms = torch.sqrt(torch.mean(torch.square(ref_wav))).item()
+        ref_rms = float(np.sqrt(np.mean(ref_wav ** 2)))
         if 0 < ref_rms < 0.1:
             ref_wav = ref_wav * 0.1 / ref_rms
 
@@ -630,15 +636,9 @@ class OmniVoice(PreTrainedModel):
             # Skip trimming when ref_text is user-provided, otherwise the
             # trimmed audio will no longer match the full transcript.
             if ref_text is None:
-                ref_wav = trim_long_audio(ref_wav, self.sampling_rate)
-            elif ref_wav.size(-1) / self.sampling_rate > 20.0:
-                logger.warning(
-                    "Reference audio is %.1fs long (>20s) and ref_text was "
-                    "provided, so automatic trimming is skipped. A long reference "
-                    "may cause slower generation and degraded quality.",
-                    ref_wav.size(-1) / self.sampling_rate,
+                ref_wav = trim_long_audio(
+                    ref_wav, self.sampling_rate, trim_threshold=20.0
                 )
-
             ref_wav = remove_silence(
                 ref_wav,
                 self.sampling_rate,
@@ -646,11 +646,20 @@ class OmniVoice(PreTrainedModel):
                 lead_sil=100,
                 trail_sil=200,
             )
-            if ref_wav.size(-1) == 0:
+            if ref_wav.shape[-1] == 0:
                 raise ValueError(
                     "Reference audio is empty after silence removal. "
                     "Try setting preprocess_prompt=False."
                 )
+
+        ref_duration = ref_wav.shape[-1] / self.sampling_rate
+        if ref_duration > 20.0:
+            logger.warning(
+                "Reference audio is %.1fs long (>20s). This may cause slower "
+                "generation, higher memory usage, and degraded voice cloning "
+                "quality. We recommend trimming it to 3-10s.",
+                ref_duration,
+            )
 
         # Auto-transcribe if ref_text not provided
         if ref_text is None:
@@ -661,10 +670,14 @@ class OmniVoice(PreTrainedModel):
             logger.debug("Auto-transcribed ref_text: %s", ref_text)
 
         chunk_size = self.audio_tokenizer.config.hop_length
-        clip_size = int(ref_wav.size(-1) % chunk_size)
+        clip_size = int(ref_wav.shape[-1] % chunk_size)
         ref_wav = ref_wav[:, :-clip_size] if clip_size > 0 else ref_wav
+        # numpy → torch at tokenizer boundary
+        ref_wav_tensor = torch.from_numpy(ref_wav).to(
+            self.audio_tokenizer.device
+        )
         ref_audio_tokens = self.audio_tokenizer.encode(
-            ref_wav.unsqueeze(0).to(self.audio_tokenizer.device),
+            ref_wav_tensor.unsqueeze(0),
         ).audio_codes.squeeze(
             0
         )  # (C, T)
@@ -683,7 +696,7 @@ class OmniVoice(PreTrainedModel):
         tokens: Union[torch.Tensor, List[torch.Tensor]],
         rms: Union[float, None],
         gen_config: OmniVoiceGenerationConfig,
-    ) -> torch.Tensor:
+    ) -> np.ndarray:
         """
         Args:
             tokens: Audio tokens — either a single tensor of shape
@@ -691,7 +704,7 @@ class OmniVoice(PreTrainedModel):
             rms: RMS of the reference audio for volume adjustment.
             gen_config: Generation config for post-processing options.
         Returns:
-            Decoded and post-processed audio tensor of shape (1, T).
+            Decoded and post-processed audio array of shape (T,).
         """
         tokenizer_device = self.audio_tokenizer.device
         if isinstance(tokens, list):
@@ -699,6 +712,7 @@ class OmniVoice(PreTrainedModel):
                 self.audio_tokenizer.decode(t.to(tokenizer_device).unsqueeze(0))
                 .audio_values[0]
                 .cpu()
+                .numpy()
                 for t in tokens
             ]
             audio_waveform = cross_fade_chunks(chunk_audios, self.sampling_rate)
@@ -707,28 +721,30 @@ class OmniVoice(PreTrainedModel):
                 self.audio_tokenizer.decode(tokens.to(tokenizer_device).unsqueeze(0))
                 .audio_values[0]
                 .cpu()
+                .numpy()
             )
 
-        return self._post_process_audio(
+        audio_waveform = self._post_process_audio(
             audio_waveform,
             postprocess_output=gen_config.postprocess_output,
             ref_rms=rms,
         )
+        return audio_waveform.squeeze(0)
 
     def _post_process_audio(
         self,
-        generated_audio: torch.Tensor,
+        generated_audio: np.ndarray,
         postprocess_output: bool,
         ref_rms: Union[float, None],
-    ) -> torch.Tensor:
+    ) -> np.ndarray:
         """Optionally remove long silences, adjust volume, and add edge padding.
 
         Args:
-            generated_audio: Audio tensor of shape (1, T).
+            generated_audio: Numpy array of shape (1, T).
             postprocess_output: If True, remove long silences and apply fade/pad.
             ref_rms: RMS of the reference audio for volume normalisation.
         Returns:
-            Processed audio tensor of shape (1, T).
+            Processed numpy array of shape (1, T).
         """
         if postprocess_output:
             generated_audio = remove_silence(
@@ -742,9 +758,7 @@ class OmniVoice(PreTrainedModel):
         if ref_rms is not None and ref_rms < 0.1:
             generated_audio = generated_audio * ref_rms / 0.1
         elif ref_rms is None:
-            # No reference audio (voice design): peak-normalize to 0.5
-            # to avoid clipping while keeping a comfortable volume level.
-            peak = generated_audio.abs().max()
+            peak = np.abs(generated_audio).max()
             if peak > 1e-6:
                 generated_audio = generated_audio / peak * 0.5
 
@@ -1073,12 +1087,10 @@ class OmniVoice(PreTrainedModel):
 
         # Build text tokens
         full_text = _combine_text(ref_text=ref_text, text=text)
+        wrapped_text = f"<|text_start|>{full_text}<|text_end|>"
         text_tokens = (
-            self.text_tokenizer(
-                f"<|text_start|>{full_text}<|text_end|>",
-                return_tensors="pt",
-            )
-            .input_ids.repeat(self.config.num_audio_codebook, 1)
+            _tokenize_with_nonverbal_tags(wrapped_text, self.text_tokenizer)
+            .repeat(self.config.num_audio_codebook, 1)
             .unsqueeze(0)
         ).to(
             self.device
@@ -1490,6 +1502,53 @@ def _get_time_steps(
     return timesteps
 
 
+_NONVERBAL_PATTERN = re.compile(
+    r"\[(laughter|sigh|confirmation-en|question-en|question-ah|question-oh|"
+    r"question-ei|question-yi|surprise-ah|surprise-oh|surprise-wa|"
+    r"surprise-yo|dissatisfaction-hnn)\]"
+)
+
+
+def _tokenize_with_nonverbal_tags(text: str, tokenizer) -> torch.Tensor:
+    """Tokenize text containing non-verbal tags, handling each tag independently.
+
+    Non-verbal tags are tokenized standalone to guarantee consistent token
+    IDs regardless of surrounding language context (Chinese, English, etc.).
+
+    Args:
+        text: Full text string potentially containing non-verbal tags.
+        tokenizer: HuggingFace text tokenizer instance.
+    Returns:
+        Token IDs tensor of shape (1, seq_len).
+    """
+    parts = []
+    last_end = 0
+    for m in _NONVERBAL_PATTERN.finditer(text):
+        if m.start() > last_end:
+            segment = text[last_end : m.start()]
+            ids = tokenizer(segment, add_special_tokens=False).input_ids
+            if ids:
+                parts.append(ids)
+        tag_ids = tokenizer(m.group(), add_special_tokens=False).input_ids
+        if tag_ids:
+            parts.append(tag_ids)
+        last_end = m.end()
+    if last_end < len(text):
+        segment = text[last_end:]
+        ids = tokenizer(segment, add_special_tokens=False).input_ids
+        if ids:
+            parts.append(ids)
+
+    if not parts:
+        result = tokenizer(text, return_tensors="pt").input_ids
+    else:
+        combined = []
+        for p in parts:
+            combined.extend(p)
+        result = torch.tensor([combined], dtype=torch.long)
+    return result
+
+
 def _combine_text(text, ref_text: Optional[str] = None) -> str:
 
     # combine with reference text if not None
@@ -1498,23 +1557,19 @@ def _combine_text(text, ref_text: Optional[str] = None) -> str:
     else:
         full_text = text.strip()
 
-    # replace \n with .
-    full_text = re.sub(r"[ \t]*\r?\n[\s]*", ".", full_text)
+    # filter out newline / carriage-return characters
+    full_text = re.sub(r"[\r\n]+", "", full_text)
+
+    # replace Chinese parentheses with English ones
+    full_text = full_text.replace("\uff08", "(").replace("\uff09", ")")
+
+    # collapse consecutive spaces / tabs into a single space
+    full_text = re.sub(r"[ \t]+", " ", full_text)
 
     # remove spaces around chinese characters
     chinese_range = r"[\u4e00-\u9fff]"
     pattern = rf"(?<={chinese_range})\s+|\s+(?={chinese_range})"
     full_text = re.sub(pattern, "", full_text)
-
-    # Remove whitespace immediately before special emotion tags (except
-    # [laughter]).  During training these tags have no preceding space, so
-    # the text tokenizer would mis-tokenise them if spaces were present.
-    _EMOTION_TAGS = (
-        r"sigh|confirmation-en|question-en|question-ah|question-oh|"
-        r"question-ei|question-yi|surprise-ah|surprise-oh|surprise-wa|"
-        r"surprise-yo|dissatisfaction-hnn"
-    )
-    full_text = re.sub(rf"\s+(\[({_EMOTION_TAGS})\])", r"\1", full_text)
 
     return full_text
 
